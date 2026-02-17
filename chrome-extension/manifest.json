@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Recruiter AI Coach",
+  "version": "1.0.0",
+  "description": "AI-подсказки для рекрутеров в реальном времени во время звонков",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": [
+    "https://meet.google.com/*",
+    "https://zoom.us/*",
+    "http://localhost:3000/*",
+    "ws://localhost:3000/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://meet.google.com/*", "https://zoom.us/*"],
+      "js": ["content.js"],
+      "css": ["overlay.css"]
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Recruiter AI Coach"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
