@@ -4,7 +4,6 @@ const axios = require('axios');
 const FIREFLIES_API_KEY = process.env.FIREFLIES_API_KEY;
 const GRAPHQL_URL = 'https://api.fireflies.ai/graphql';
 
-// GraphQL helper
 async function gql(query, variables = {}) {
   const res = await axios.post(
     GRAPHQL_URL,
@@ -22,17 +21,11 @@ async function gql(query, variables = {}) {
   return res.data.data;
 }
 
-// Получить список активных митингов
 async function getActiveMeetings() {
   const query = `
     query ActiveMeetings {
       active_meetings {
-        id
-        title
-        organizer_email
-        meeting_link
-        start_time
-        state
+        id title organizer_email meeting_link start_time state
       }
     }
   `;
@@ -40,27 +33,13 @@ async function getActiveMeetings() {
   return data.active_meetings || [];
 }
 
-// Получить транскрипт по ID (после звонка или для проверки)
 async function getTranscript(id) {
   const query = `
     query GetTranscript($id: String!) {
       transcript(id: $id) {
-        id
-        title
-        date
-        duration
-        sentences {
-          index
-          text
-          speaker_name
-          start_time
-          end_time
-        }
-        summary {
-          keywords
-          overview
-          action_items
-        }
+        id title date duration
+        sentences { index text speaker_name start_time end_time }
+        summary { keywords overview action_items }
       }
     }
   `;
@@ -68,18 +47,12 @@ async function getTranscript(id) {
   return data.transcript;
 }
 
-// Получить последние транскрипты
 async function getRecentTranscripts(limit = 5) {
   const query = `
     query RecentTranscripts($limit: Int) {
       transcripts(limit: $limit, mine: true) {
-        id
-        title
-        date
-        duration
-        speakers {
-          name
-        }
+        id title date duration
+        speakers { name }
       }
     }
   `;
@@ -87,9 +60,64 @@ async function getRecentTranscripts(limit = 5) {
   return data.transcripts || [];
 }
 
-// Подключиться к Realtime WebSocket для живой транскрипции
-function connectRealtime(transcriptId, onTranscription, onStatus) {
-  console.log(`[Fireflies] Connecting to realtime for transcript: ${transcriptId}`);
+// Polling-based realtime (fallback когда WebSocket API недоступен)
+function connectRealtimePolling(transcriptId, onTranscription, onStatus, intervalMs = 5000) {
+  console.log(`[Fireflies] Starting polling for transcript: ${transcriptId} (every ${intervalMs}ms)`);
+  onStatus('listening');
+
+  let lastSentenceIndex = -1;
+  let running = true;
+
+  const poll = async () => {
+    if (!running) return;
+    try {
+      const data = await gql(`
+        query T($id: String!) {
+          transcript(id: $id) {
+            sentences { index text speaker_name start_time end_time }
+          }
+        }
+      `, { id: transcriptId });
+
+      const sentences = data.transcript?.sentences || [];
+      const newOnes = sentences.filter(s => s.index > lastSentenceIndex);
+
+      for (const s of newOnes) {
+        lastSentenceIndex = s.index;
+        const segment = {
+          chunkId: `${transcriptId}_${s.index}`,
+          text: s.text?.trim(),
+          speaker: s.speaker_name || 'Unknown',
+          startTime: s.start_time,
+          endTime: s.end_time,
+          timestamp: new Date().toISOString(),
+        };
+        if (segment.text) {
+          console.log(`[Fireflies] [${segment.speaker}]: ${segment.text}`);
+          onTranscription(segment);
+        }
+      }
+    } catch (err) {
+      console.error('[Fireflies] Polling error:', err.message);
+    }
+
+    if (running) setTimeout(poll, intervalMs);
+  };
+
+  poll();
+
+  return {
+    disconnect: () => {
+      running = false;
+      console.log('[Fireflies] Polling stopped');
+      onStatus('disconnected');
+    },
+  };
+}
+
+// WebSocket Realtime API (основной, если поддерживается планом)
+function connectRealtimeWS(transcriptId, onTranscription, onStatus) {
+  console.log(`[Fireflies] Connecting WebSocket realtime for: ${transcriptId}`);
 
   const socket = io('wss://api.fireflies.ai', {
     path: '/ws/realtime',
@@ -98,42 +126,47 @@ function connectRealtime(transcriptId, onTranscription, onStatus) {
       token: `Bearer ${FIREFLIES_API_KEY}`,
       transcriptId,
     },
+    timeout: 10000,
   });
 
-  const seenChunks = new Map(); // chunk_id → last text (для дедупликации)
+  const seenChunks = new Map();
+  let gotData = false;
+
+  // Если за 15 секунд нет данных — падаем на polling
+  const fallbackTimer = setTimeout(() => {
+    if (!gotData) {
+      console.log('[Fireflies] No realtime data in 15s, switching to polling...');
+      socket.disconnect();
+    }
+  }, 15000);
 
   socket.on('connect', () => {
-    console.log('[Fireflies] Socket connected');
-    if (onStatus) onStatus('connected');
+    console.log('[Fireflies] WS connected');
+    onStatus('connected');
   });
 
   socket.on('auth.success', () => {
-    console.log('[Fireflies] Auth successful');
-    if (onStatus) onStatus('authenticated');
+    console.log('[Fireflies] WS auth OK');
+    onStatus('authenticated');
   });
 
-  socket.on('auth.failed', (data) => {
-    console.error('[Fireflies] Auth failed:', data);
-    if (onStatus) onStatus('auth_failed');
+  socket.on('auth.failed', () => {
+    console.error('[Fireflies] WS auth failed');
+    clearTimeout(fallbackTimer);
+    socket.disconnect();
   });
 
   socket.on('connection.established', () => {
-    console.log('[Fireflies] Connection established, listening for transcription...');
-    if (onStatus) onStatus('listening');
-  });
-
-  socket.on('connection.error', (data) => {
-    console.error('[Fireflies] Connection error:', data);
-    if (onStatus) onStatus('error');
+    console.log('[Fireflies] WS listening...');
+    onStatus('listening');
   });
 
   socket.on('transcription.broadcast', (data) => {
+    gotData = true;
+    clearTimeout(fallbackTimer);
     const { chunk_id, text, speaker_name, start_time, end_time } = data;
-
-    // Дедупликация: если тот же chunk с тем же текстом — пропускаем
     if (seenChunks.get(chunk_id) === text) return;
     seenChunks.set(chunk_id, text);
-
     const segment = {
       chunkId: chunk_id,
       text: text?.trim(),
@@ -142,7 +175,6 @@ function connectRealtime(transcriptId, onTranscription, onStatus) {
       endTime: end_time,
       timestamp: new Date().toISOString(),
     };
-
     if (segment.text) {
       console.log(`[Fireflies] [${segment.speaker}]: ${segment.text}`);
       onTranscription(segment);
@@ -150,18 +182,36 @@ function connectRealtime(transcriptId, onTranscription, onStatus) {
   });
 
   socket.on('disconnect', (reason) => {
-    console.log('[Fireflies] Disconnected:', reason);
-    if (onStatus) onStatus('disconnected');
+    console.log('[Fireflies] WS disconnected:', reason);
+    onStatus('disconnected');
   });
 
   socket.on('connect_error', (err) => {
-    console.error('[Fireflies] Connect error:', err.message);
-    if (onStatus) onStatus('error');
+    console.error('[Fireflies] WS connect error:', err.message);
+    clearTimeout(fallbackTimer);
+  });
+
+  return { disconnect: () => { clearTimeout(fallbackTimer); socket.disconnect(); }, socket };
+}
+
+// Основная точка входа: сначала пробует WS, при неудаче — polling
+function connectRealtime(transcriptId, onTranscription, onStatus) {
+  let pollingConn = null;
+
+  const wsConn = connectRealtimeWS(transcriptId, onTranscription, (status) => {
+    onStatus(status);
+    // Если WS отвалился — включаем polling
+    if (status === 'disconnected' && !pollingConn) {
+      console.log('[Fireflies] Falling back to polling');
+      pollingConn = connectRealtimePolling(transcriptId, onTranscription, onStatus);
+    }
   });
 
   return {
-    disconnect: () => socket.disconnect(),
-    socket,
+    disconnect: () => {
+      wsConn.disconnect();
+      pollingConn?.disconnect();
+    },
   };
 }
 
@@ -170,4 +220,5 @@ module.exports = {
   getTranscript,
   getRecentTranscripts,
   connectRealtime,
+  connectRealtimePolling,
 };

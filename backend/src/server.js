@@ -128,6 +128,35 @@ app.post('/api/session/stop', (req, res) => {
   res.json({ status: 'stopped' });
 });
 
+// Браузерный сегмент речи (из Chrome Extension Web Speech API)
+app.post('/api/browser-segment', async (req, res) => {
+  const { sessionId, text, speaker } = req.body;
+  if (!text) return res.json({ hint: null });
+
+  const segment = { chunkId: `browser_${Date.now()}`, text, speaker: speaker || 'Speaker', timestamp: new Date().toISOString() };
+  claude.addToContext(sessionId, segment);
+
+  const hint = await claude.generateHint(sessionId, segment);
+
+  // Отправить в Telegram тоже
+  if (hint) {
+    const { sendHint } = require('./telegram');
+    sendHint(process.env.TELEGRAM_CHAT_ID, hint).catch(() => {});
+  }
+
+  res.json({ hint });
+});
+
+// Отправить подсказку напрямую в Telegram (из content script)
+app.post('/api/hint-to-telegram', async (req, res) => {
+  const { hint } = req.body;
+  if (hint) {
+    const { sendHint } = require('./telegram');
+    await sendHint(process.env.TELEGRAM_CHAT_ID, hint).catch(() => {});
+  }
+  res.json({ ok: true });
+});
+
 // Pre-interview подготовка
 app.post('/api/prepare', async (req, res) => {
   const { candidateCV, jobDescription, role } = req.body;
