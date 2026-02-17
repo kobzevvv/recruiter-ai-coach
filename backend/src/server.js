@@ -159,6 +159,50 @@ app.get('/api/session/:sessionId/hints', (req, res) => {
   res.json({ hints, segments });
 });
 
+// Тест-симуляция: прогоняем диалог через Claude и отправляем подсказки в Telegram
+app.post('/api/test/simulate', async (req, res) => {
+  const sessionId = 'test_session';
+  claude.clearSession(sessionId);
+
+  const { sendHint } = require('./telegram');
+  const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+  await sendHint(CHAT_ID, '🎬 *Симуляция интервью запущена!*\nСейчас пойдут реплики кандидата...');
+
+  const dialogue = [
+    { speaker: 'Recruiter', text: 'Расскажи про свой опыт с фронтенд-фреймворками' },
+    { speaker: 'Candidate', text: 'Ну я работал с реактом, вюшкой, в общем со всем понемножку' },
+    { speaker: 'Recruiter', text: 'Понятно. А какой стейт-менеджмент использовал?' },
+    { speaker: 'Candidate', text: 'Редакс в основном, ну там всякое разное' },
+    { speaker: 'Recruiter', text: 'Хорошо. Расскажи про последний проект' },
+    { speaker: 'Candidate', text: 'Делал интернет-магазин, там были компоненты, апи, база данных, в общем всё стандартное' },
+    { speaker: 'Recruiter', text: 'А как у тебя с TypeScript?' },
+    { speaker: 'Candidate', text: 'Да, использовал TypeScript, знаю его хорошо, типы там и всё такое' },
+    { speaker: 'Recruiter', text: 'Как вы деплоили проект?' },
+    { speaker: 'Candidate', text: 'Через докер, CI/CD было настроено, в облако деплоили' },
+  ];
+
+  res.json({ status: 'started', segments: dialogue.length });
+
+  // Прогоняем диалог с задержками
+  for (const seg of dialogue) {
+    await new Promise((r) => setTimeout(r, 1500));
+    await sendHint(CHAT_ID, `💬 *${seg.speaker}:* ${seg.text}`);
+    claude.addToContext(sessionId, seg);
+
+    // Сбрасываем throttle для теста (каждые 3 реплики)
+    const ctx = claude.getContext ? claude.getContext(sessionId) : null;
+
+    const hint = await claude.generateHint(sessionId, seg, { noThrottle: true });
+    if (hint) {
+      await new Promise((r) => setTimeout(r, 500));
+      await sendHint(CHAT_ID, hint);
+    }
+  }
+
+  await sendHint(CHAT_ID, '✅ *Симуляция завершена!*');
+});
+
 // Получить транскрипт из Fireflies
 app.get('/api/transcript/:id', async (req, res) => {
   try {

@@ -54,13 +54,13 @@ function setPrepContext(sessionId, prepContext) {
   sessionContexts.get(sessionId).prepContext = prepContext;
 }
 
-async function generateHint(sessionId, newSegment) {
+async function generateHint(sessionId, newSegment, { noThrottle = false } = {}) {
   const ctx = sessionContexts.get(sessionId);
   if (!ctx) return null;
 
-  // Throttling: не чаще раз в 20 секунд
+  // Throttling: не чаще раз в 20 секунд (отключается в тест-режиме)
   const now = Date.now();
-  if (now - ctx.lastHintAt < 20000) return null;
+  if (!noThrottle && now - ctx.lastHintAt < 20000) return null;
 
   const recentSegments = ctx.segments.slice(-10);
   const recentText = recentSegments.map((s) => `${s.speaker}: ${s.text}`).join('\n');
