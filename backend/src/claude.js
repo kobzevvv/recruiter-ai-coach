@@ -1,6 +1,6 @@
-const Anthropic = require('@anthropic-ai/sdk');
+const OpenAI = require('openai');
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const SYSTEM_PROMPT = `Ты — AI-ассистент для рекрутера во время технического собеседования.
 Ты получаешь транскрипцию разговора в реальном времени и генерируешь краткие подсказки.
@@ -31,7 +31,6 @@ const SYSTEM_PROMPT = `Ты — AI-ассистент для рекрутера 
 // Хранилище контекста разговора по сессиям
 const sessionContexts = new Map();
 
-// Добавить сегмент в контекст сессии
 function addToContext(sessionId, segment) {
   if (!sessionContexts.has(sessionId)) {
     sessionContexts.set(sessionId, {
@@ -43,14 +42,11 @@ function addToContext(sessionId, segment) {
   }
   const ctx = sessionContexts.get(sessionId);
   ctx.segments.push(segment);
-
-  // Держим последние 50 сегментов для контекста (не засорять окно)
   if (ctx.segments.length > 50) {
     ctx.segments = ctx.segments.slice(-50);
   }
 }
 
-// Установить prep context для сессии (из подготовки к интервью)
 function setPrepContext(sessionId, prepContext) {
   if (!sessionContexts.has(sessionId)) {
     sessionContexts.set(sessionId, { segments: [], prepContext: null, lastHintAt: 0, hintCount: 0 });
@@ -58,19 +54,16 @@ function setPrepContext(sessionId, prepContext) {
   sessionContexts.get(sessionId).prepContext = prepContext;
 }
 
-// Сгенерировать подсказку на основе последних сегментов
 async function generateHint(sessionId, newSegment) {
   const ctx = sessionContexts.get(sessionId);
   if (!ctx) return null;
 
-  // Throttling: не чаще чем раз в 20 секунд
+  // Throttling: не чаще раз в 20 секунд
   const now = Date.now();
   if (now - ctx.lastHintAt < 20000) return null;
 
-  // Накапливаем несколько сегментов перед генерацией (минимум 3 новых слова)
   const recentSegments = ctx.segments.slice(-10);
   const recentText = recentSegments.map((s) => `${s.speaker}: ${s.text}`).join('\n');
-
   if (recentText.length < 30) return null;
 
   const prepSection = ctx.prepContext
@@ -86,14 +79,16 @@ ${recentText}
 Нужна ли рекрутеру подсказка прямо сейчас? Если да — напиши её. Если нет — пустую строку.`;
 
   try {
-    const response = await client.messages.create({
-      model: 'claude-sonnet-4-6',
+    const response = await client.chat.completions.create({
+      model: 'gpt-4o',
       max_tokens: 200,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: userMessage }],
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: userMessage },
+      ],
     });
 
-    const hint = response.content[0]?.text?.trim();
+    const hint = response.choices[0]?.message?.content?.trim();
     if (hint && hint.length > 2) {
       ctx.lastHintAt = now;
       ctx.hintCount++;
@@ -101,12 +96,11 @@ ${recentText}
     }
     return null;
   } catch (err) {
-    console.error('[Claude] Error generating hint:', err.message);
+    console.error('[OpenAI] Error generating hint:', err.message);
     return null;
   }
 }
 
-// Генерация prep kit перед интервью
 async function generatePrepKit(candidateCV, jobDescription, role) {
   const prompt = `Подготовь рекрутера к техническому интервью на позицию: ${role}
 
@@ -127,16 +121,15 @@ ${jobDescription}
 
 Отвечай кратко, по делу. Рекрутер — не технарь, но должен казаться компетентным.`;
 
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-6',
+  const response = await client.chat.completions.create({
+    model: 'gpt-4o',
     max_tokens: 1500,
     messages: [{ role: 'user', content: prompt }],
   });
 
-  return response.content[0]?.text;
+  return response.choices[0]?.message?.content;
 }
 
-// Очистить контекст сессии
 function clearSession(sessionId) {
   sessionContexts.delete(sessionId);
 }
