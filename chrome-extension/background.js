@@ -1,126 +1,153 @@
-// Recruiter AI Coach — Service Worker
-// Управляет WebSocket соединением с backend и рассылает события в popup/content
+// Recruiter AI Coach — Service Worker (background.js)
+// Управляет захватом вкладки через tabCapture + offscreen document
 
-let socket = null;
-let currentSessionId = null;
-let backendUrl = 'http://localhost:3000';
+const BACKEND_URL = 'http://localhost:3000';
 
-// Слушаем сообщения от popup
+let isCapturing = false;
+let currentTabId = null;
+let offscreenReady = false;
+
+// ── Слушаем сообщения от popup и offscreen ──────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === 'start_session') {
-    startSession(msg.backendUrl, msg.transcriptId).then(sendResponse);
+
+  if (msg.type === 'start_capture') {
+    startTabCapture().then(sendResponse);
     return true; // async
   }
-  if (msg.type === 'stop_session') {
-    stopSession();
-    sendResponse({ status: 'stopped' });
+
+  if (msg.type === 'stop_capture') {
+    stopTabCapture().then(sendResponse);
+    return true;
   }
+
   if (msg.type === 'get_status') {
-    sendResponse({ sessionId: currentSessionId, connected: !!socket });
+    sendResponse({ isCapturing, tabId: currentTabId });
+    return;
+  }
+
+  // Сообщения от offscreen → пересылаем в content.js
+  if (msg.type === 'hint') {
+    broadcastToMeetTab({ type: 'hint', hint: msg.hint });
+    return;
+  }
+
+  if (msg.type === 'transcript_interim') {
+    broadcastToMeetTab({ type: 'transcript_interim', text: msg.text });
+    return;
+  }
+
+  if (msg.type === 'capture_started') {
+    isCapturing = true;
+    broadcastToMeetTab({ type: 'status', status: 'listening' });
+    return;
+  }
+
+  if (msg.type === 'capture_error') {
+    isCapturing = false;
+    broadcastToMeetTab({ type: 'status', status: 'error', error: msg.error });
+    console.error('[Background] Capture error:', msg.error);
+    return;
   }
 });
 
-async function startSession(url, transcriptId) {
-  backendUrl = url;
-
-  // Остановить предыдущую сессию
-  if (socket) stopSession();
-
+// ── Основная логика tabCapture ───────────────────────
+async function startTabCapture() {
   try {
-    // Запустить сессию на backend
-    const res = await fetch(`${backendUrl}/api/session/start`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ transcriptId }),
+    // Найти активную вкладку с Meet или Zoom
+    const [tab] = await chrome.tabs.query({
+      active: true,
+      url: ['https://meet.google.com/*', 'https://zoom.us/*']
     });
 
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to start session');
+    if (!tab) {
+      // Если активная вкладка не Meet/Zoom — ищем любую Meet/Zoom вкладку
+      const tabs = await chrome.tabs.query({
+        url: ['https://meet.google.com/*', 'https://zoom.us/*']
+      });
+      if (!tabs.length) {
+        return { error: 'Открой Google Meet или Zoom в браузере' };
+      }
+    }
 
-    currentSessionId = data.sessionId;
+    const targetTab = tab || (await chrome.tabs.query({
+      url: ['https://meet.google.com/*', 'https://zoom.us/*']
+    }))[0];
 
-    // Подключиться к WebSocket
-    connectWebSocket(currentSessionId);
+    currentTabId = targetTab.id;
 
-    return { sessionId: currentSessionId };
+    // Получаем streamId для вкладки (не MediaStream — он не работает в service worker)
+    const streamId = await new Promise((resolve, reject) => {
+      chrome.tabCapture.getMediaStreamId(
+        { targetTabId: currentTabId },
+        (id) => {
+          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+          else resolve(id);
+        }
+      );
+    });
+
+    // Создаём offscreen document если нет
+    await ensureOffscreen();
+
+    // Передаём streamId в offscreen — там захватят аудио и запустят транскрипцию
+    await chrome.runtime.sendMessage({
+      target: 'offscreen',
+      type: 'start_capture',
+      streamId,
+      sessionId: 'tab_' + currentTabId,
+    });
+
+    return { ok: true, tabId: currentTabId };
+
   } catch (err) {
-    console.error('[Background] Start session error:', err);
+    console.error('[Background] startTabCapture error:', err);
     return { error: err.message };
   }
 }
 
-function connectWebSocket(sessionId) {
-  // Используем динамический import для socket.io-client в service worker
-  // В MV3 нельзя использовать require(), поэтому подключаем через importScripts
-  // Для простоты используем нативный WebSocket с fallback
+async function stopTabCapture() {
+  isCapturing = false;
+  currentTabId = null;
 
-  const wsUrl = backendUrl.replace(/^http/, 'ws');
+  await chrome.runtime.sendMessage({
+    target: 'offscreen',
+    type: 'stop_capture',
+  }).catch(() => {});
 
-  // Попытка через socket.io (если доступен)
-  // В production здесь был бы полноценный socket.io-client
-  // MVP: используем polling через fetch
-
-  broadcast('status', { status: 'listening' });
-
-  // Polling hints каждые 2 секунды (временное решение пока нет WS в MV3)
-  startPolling(sessionId);
+  broadcastToMeetTab({ type: 'status', status: 'stopped' });
+  return { ok: true };
 }
 
-let pollInterval = null;
-let lastHintTs = null;
+// ── Offscreen document management ───────────────────
+async function ensureOffscreen() {
+  if (offscreenReady) return;
 
-function startPolling(sessionId) {
-  if (pollInterval) clearInterval(pollInterval);
-
-  pollInterval = setInterval(async () => {
-    try {
-      const res = await fetch(`${backendUrl}/api/session/${sessionId}/hints?since=${lastHintTs || ''}`);
-      if (!res.ok) return;
-      const data = await res.json();
-
-      if (data.hints?.length) {
-        data.hints.forEach((h) => {
-          broadcast('hint', { hint: h.hint });
-          lastHintTs = h.timestamp;
-        });
-      }
-      if (data.segments?.length) {
-        data.segments.forEach((s) => broadcast('transcription', { segment: s }));
-      }
-    } catch (err) {
-      // silently ignore network errors during polling
-    }
-  }, 2000);
-}
-
-function stopSession() {
-  if (pollInterval) {
-    clearInterval(pollInterval);
-    pollInterval = null;
+  const existing = await chrome.offscreen.hasDocument?.();
+  if (existing) {
+    offscreenReady = true;
+    return;
   }
-  if (socket) {
-    socket.disconnect?.();
-    socket = null;
-  }
-  if (currentSessionId) {
-    fetch(`${backendUrl}/api/session/stop`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId: currentSessionId }),
-    }).catch(() => {});
-  }
-  currentSessionId = null;
-  broadcast('status', { status: 'disconnected' });
-}
 
-// Разослать сообщение во все вкладки и popup
-function broadcast(type, data) {
-  chrome.runtime.sendMessage({ type, ...data }).catch(() => {});
-
-  // Также в content scripts на активных вкладках
-  chrome.tabs.query({ url: ['https://meet.google.com/*', 'https://zoom.us/*'] }, (tabs) => {
-    tabs.forEach((tab) => {
-      chrome.tabs.sendMessage(tab.id, { type, ...data }).catch(() => {});
-    });
+  await chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['USER_MEDIA'],
+    justification: 'Transcribe tab audio for recruiter AI hints',
   });
+
+  offscreenReady = true;
+}
+
+// ── Broadcast в content.js на вкладке Meet/Zoom ─────
+function broadcastToMeetTab(message) {
+  chrome.tabs.query(
+    { url: ['https://meet.google.com/*', 'https://zoom.us/*'] },
+    (tabs) => {
+      tabs.forEach((tab) => {
+        chrome.tabs.sendMessage(tab.id, message).catch(() => {});
+      });
+    }
+  );
+
+  // Также в popup если открыт
+  chrome.runtime.sendMessage(message).catch(() => {});
 }

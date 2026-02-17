@@ -1,35 +1,25 @@
 // Recruiter AI Coach — Content Script
-// Встраивается в Google Meet/Zoom
-// Использует Web Speech API для транскрипции прямо в браузере
+// Только UI: оверлей с подсказками на Google Meet / Zoom
+// Аудио захватывается в offscreen.js через tabCapture API
 
 (function () {
   if (document.getElementById('rac-overlay')) return;
 
-  const BACKEND_URL = 'http://localhost:3000';
-  let sessionId = null;
-  let recognition = null;
-  let isListening = false;
-
-  // ── Overlay UI ─────────────────────────────────────
+  // ── Overlay UI ────────────────────────────────────
   const overlay = document.createElement('div');
   overlay.id = 'rac-overlay';
   overlay.innerHTML = `
     <div id="rac-header">
       <span>🎯 AI Coach</span>
-      <div id="rac-status-dot"></div>
+      <div id="rac-dot"></div>
       <button id="rac-toggle">−</button>
     </div>
     <div id="rac-body">
-      <div id="rac-controls">
-        <button id="rac-start-btn">▶ Начать запись</button>
+      <div id="rac-transcript">
+        <span id="rac-interim">Нажми ▶ в popup расширения...</span>
       </div>
-      <div id="rac-transcript-box">
-        <div id="rac-transcript-label">Транскрипция:</div>
-        <div id="rac-transcript-text">—</div>
-      </div>
-      <div id="rac-hints-label">💡 Подсказки:</div>
+      <div id="rac-hints-title">💡 Подсказки</div>
       <div id="rac-hints"></div>
-      <div id="rac-empty">Нажми ▶ и говори...</div>
     </div>
   `;
 
@@ -37,9 +27,10 @@
   style.textContent = `
     #rac-overlay {
       position: fixed; top: 20px; right: 20px; width: 300px;
-      z-index: 99999; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      z-index: 2147483647;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       font-size: 13px; border-radius: 12px; overflow: hidden;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.5); user-select: none;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.55);
     }
     #rac-header {
       background: linear-gradient(135deg, #6366f1, #8b5cf6);
@@ -47,67 +38,65 @@
       display: flex; align-items: center; gap: 8px;
       font-weight: 600; cursor: move;
     }
-    #rac-status-dot {
+    #rac-dot {
       width: 8px; height: 8px; border-radius: 50%;
-      background: #555; margin-left: auto;
+      background: rgba(255,255,255,0.3); margin-left: auto;
+      transition: background 0.3s;
     }
-    #rac-status-dot.active { background: #22c55e; animation: racPulse 1.5s infinite; }
-    @keyframes racPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+    #rac-dot.on { background: #4ade80; animation: pulse 1.5s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
     #rac-toggle {
       background: rgba(255,255,255,0.2); border: none; color: #fff;
-      width: 22px; height: 22px; border-radius: 50%; cursor: pointer; font-size: 14px;
+      width: 22px; height: 22px; border-radius: 50%; cursor: pointer;
     }
     #rac-body {
-      background: rgba(15,15,15,0.95); backdrop-filter: blur(8px);
-      padding: 10px; max-height: 380px; overflow-y: auto;
+      background: rgba(13,13,13,0.96);
+      backdrop-filter: blur(10px);
+      padding: 10px;
+      max-height: 380px; overflow-y: auto;
     }
-    #rac-controls { margin-bottom: 8px; }
-    #rac-start-btn {
-      width: 100%; padding: 8px; background: #6366f1; color: #fff;
-      border: none; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600;
+    #rac-transcript {
+      background: #111; border-radius: 6px; padding: 8px;
+      font-size: 12px; color: #666; min-height: 36px;
+      margin-bottom: 8px; line-height: 1.5;
     }
-    #rac-start-btn.recording { background: #ef4444; }
-    #rac-transcript-box {
-      background: #111; border-radius: 6px; padding: 8px; margin-bottom: 8px; min-height: 40px;
-    }
-    #rac-transcript-label { font-size: 10px; color: #555; margin-bottom: 4px; }
-    #rac-transcript-text { color: #aaa; font-size: 12px; line-height: 1.5; }
-    #rac-hints-label { font-size: 10px; color: #555; margin-bottom: 6px; }
-    #rac-empty { color: #555; text-align: center; padding: 12px 0; font-size: 12px; }
+    #rac-interim { color: #888; }
+    #rac-hints-title { font-size: 10px; color: #444; margin-bottom: 6px; }
     .rac-hint {
-      background: #1a1a1a; border-left: 3px solid #6366f1;
+      background: #161616; border-left: 3px solid #6366f1;
       border-radius: 6px; padding: 10px 12px; margin-bottom: 8px;
-      color: #e5e7eb; line-height: 1.5;
-      animation: racIn 0.3s ease;
+      color: #e5e7eb; line-height: 1.55;
+      animation: slideIn 0.3s ease;
     }
-    @keyframes racIn { from { opacity:0; transform: translateX(10px); } to { opacity:1; transform: translateX(0); } }
+    @keyframes slideIn { from{opacity:0;transform:translateX(12px)} to{opacity:1;transform:none} }
     .rac-dismiss {
-      float: right; background: none; border: none; color: #555; cursor: pointer; font-size: 14px; padding: 0;
+      float: right; background: none; border: none;
+      color: #444; cursor: pointer; font-size: 15px; line-height: 1;
     }
-    .rac-time { font-size: 10px; color: #555; margin-top: 4px; }
+    .rac-time { font-size: 10px; color: #444; margin-top: 5px; }
   `;
 
   document.head.appendChild(style);
   document.body.appendChild(overlay);
 
-  // ── Drag ───────────────────────────────────────────
+  // ── Drag ─────────────────────────────────────────
   const header = document.getElementById('rac-header');
   let dragging = false, ox = 0, oy = 0;
   header.addEventListener('mousedown', (e) => {
-    if (e.target.id === 'rac-toggle' || e.target.id === 'rac-start-btn') return;
+    if (e.target.id === 'rac-toggle') return;
     dragging = true;
-    ox = e.clientX - overlay.getBoundingClientRect().left;
-    oy = e.clientY - overlay.getBoundingClientRect().top;
+    const r = overlay.getBoundingClientRect();
+    ox = e.clientX - r.left; oy = e.clientY - r.top;
   });
   document.addEventListener('mousemove', (e) => {
     if (!dragging) return;
+    overlay.style.right = 'auto';
     overlay.style.left = (e.clientX - ox) + 'px';
     overlay.style.top = (e.clientY - oy) + 'px';
-    overlay.style.right = 'auto';
   });
   document.addEventListener('mouseup', () => { dragging = false; });
 
-  // ── Collapse ────────────────────────────────────────
+  // ── Collapse ─────────────────────────────────────
   let collapsed = false;
   document.getElementById('rac-toggle').addEventListener('click', () => {
     collapsed = !collapsed;
@@ -115,110 +104,31 @@
     document.getElementById('rac-toggle').textContent = collapsed ? '+' : '−';
   });
 
-  // ── Web Speech API ─────────────────────────────────
-  document.getElementById('rac-start-btn').addEventListener('click', () => {
-    if (isListening) {
-      stopListening();
-    } else {
-      startListening();
-    }
+  // ── Сообщения от background ───────────────────────
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg.type === 'hint') addHint(msg.hint);
+    if (msg.type === 'transcript_interim') setInterim(msg.text);
+    if (msg.type === 'status') updateStatus(msg.status);
   });
 
-  function startListening() {
-    sessionId = 'browser_' + Date.now();
-
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      addHint('❌ Web Speech API не поддерживается в этом браузере');
-      return;
-    }
-
-    recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = 'ru-RU';
-
-    recognition.onstart = () => {
-      isListening = true;
-      document.getElementById('rac-start-btn').textContent = '⏹ Остановить';
-      document.getElementById('rac-start-btn').classList.add('recording');
-      document.getElementById('rac-status-dot').classList.add('active');
-      document.getElementById('rac-empty').style.display = 'none';
-    };
-
-    let finalBuffer = '';
-    let silenceTimer = null;
-
-    recognition.onresult = (event) => {
-      let interim = '';
-      let final = '';
-
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const text = event.results[i][0].transcript;
-        if (event.results[i].isFinal) {
-          final += text;
-        } else {
-          interim += text;
-        }
-      }
-
-      // Показываем промежуточный результат
-      document.getElementById('rac-transcript-text').textContent =
-        (finalBuffer + final || interim || '...').slice(-200);
-
-      if (final) {
-        finalBuffer += final + ' ';
-
-        // Сбрасываем таймер тишины
-        clearTimeout(silenceTimer);
-        silenceTimer = setTimeout(() => {
-          if (finalBuffer.trim().length > 10) {
-            sendSegment(finalBuffer.trim());
-            finalBuffer = '';
-          }
-        }, 2000); // отправляем после 2 сек тишины
-      }
-    };
-
-    recognition.onerror = (e) => {
-      if (e.error !== 'no-speech') console.error('Speech error:', e.error);
-    };
-
-    recognition.onend = () => {
-      // Автоперезапуск если ещё слушаем
-      if (isListening) recognition.start();
-    };
-
-    recognition.start();
+  function setInterim(text) {
+    document.getElementById('rac-interim').textContent = text?.slice(-180) || '';
   }
 
-  function stopListening() {
-    isListening = false;
-    recognition?.stop();
-    document.getElementById('rac-start-btn').textContent = '▶ Начать запись';
-    document.getElementById('rac-start-btn').classList.remove('recording');
-    document.getElementById('rac-status-dot').classList.remove('active');
-  }
-
-  async function sendSegment(text) {
-    console.log('[RAC] Sending segment:', text);
-    try {
-      const res = await fetch(`${BACKEND_URL}/api/browser-segment`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId, text, speaker: 'Speaker' }),
-      });
-      const data = await res.json();
-      if (data.hint) addHint(data.hint);
-    } catch (e) {
-      console.error('[RAC] Backend error:', e.message);
+  function updateStatus(status) {
+    const dot = document.getElementById('rac-dot');
+    if (status === 'listening') {
+      dot.classList.add('on');
+      setInterim('Слушаю...');
+    } else {
+      dot.classList.remove('on');
+      if (status === 'stopped') setInterim('Остановлено');
+      if (status === 'error') setInterim('Ошибка захвата — проверь консоль');
     }
   }
 
   function addHint(text) {
-    const hintsEl = document.getElementById('rac-hints');
-    document.getElementById('rac-empty').style.display = 'none';
-
+    const area = document.getElementById('rac-hints');
     const card = document.createElement('div');
     card.className = 'rac-hint';
     card.innerHTML = `
@@ -227,21 +137,7 @@
       <div class="rac-time">${new Date().toLocaleTimeString('ru')}</div>
     `;
     card.querySelector('.rac-dismiss').addEventListener('click', () => card.remove());
-    hintsEl.insertBefore(card, hintsEl.firstChild);
-
-    while (hintsEl.children.length > 5) hintsEl.removeChild(hintsEl.lastChild);
-
-    // Также отправить в Telegram
-    fetch(`${BACKEND_URL}/api/hint-to-telegram`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ hint: text }),
-    }).catch(() => {});
+    area.insertBefore(card, area.firstChild);
+    while (area.children.length > 5) area.removeChild(area.lastChild);
   }
-
-  // Слушаем подсказки от background (через Fireflies, если есть)
-  chrome.runtime.onMessage.addListener((msg) => {
-    if (msg.type === 'hint') addHint(msg.hint);
-  });
-
 })();
